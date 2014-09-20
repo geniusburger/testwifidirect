@@ -22,12 +22,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 
-public class MainActivity extends Activity implements WifiP2pManager.PeerListListener, View.OnClickListener {
+public class MainActivity extends Activity implements WifiDirectListener, View.OnClickListener {
 
     private static final String TAG = "WifiDirect";
     public static final int OWNER_SEND_PORT = 8988;
     public static final int OTHER_SEND_PORT = 8989;
-    private static final int SOCKET_TIMEOUT = 5000;
 
     private TextView thisDeviceTextView;
     private TextView statusTextView;
@@ -52,6 +51,8 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
     private List<WifiP2pDevice> devices;
     private WifiP2pDevice device;
     private WifiP2pInfo currentInfo;
+
+    private ReadAsyncTask readTask;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -88,12 +89,12 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
     }
 
-    protected void updateThisDevice(WifiP2pDevice device) {
+    public void deviceChanged(WifiP2pDevice device) {
         thisDeviceTextView.setText(deviceToString(device));
     }
 
-    protected void updateWifiState(boolean enabled) {
-        if(enabled) {
+    public void wifiStateChanged(boolean wifiEnabled) {
+        if(wifiEnabled) {
             // wifi direct mode enabled
             discoverPeers();
         }
@@ -122,11 +123,10 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
         progressNumber.setText(String.format("%d/%d", progress.getValue(), Progress.getMax()));
     }
 
-    public void receivedMessage(String message) {
+    public void messageReceived(String message) {
         if( currentInfo != null) {
             updateStatus(Progress.TALKING);
             rxText.setText(message);
-            listen();
         }
     }
 
@@ -153,6 +153,9 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
     }
 
     private void disconnect() {
+        if( readTask != null) {
+            readTask.cancel(false);
+        }
         manager.removeGroup(channel, disconnectListener);
     }
 
@@ -178,6 +181,9 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
     protected void onPause() {
         super.onPause();
         unregisterReceiver(receiver);
+        if( readTask != null) {
+            readTask.cancel(true);
+        }
     }
 
     @Override
@@ -232,6 +238,7 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
         @Override
         public void onFailure(int reason) {
             Toast.makeText(context, "Failed to connect: " + reason, Toast.LENGTH_SHORT).show();
+            Log.e(TAG, "Failed to connect: " + reason);
         }
     };
 
@@ -240,7 +247,7 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
         invalidateOptionsMenu();
     }
 
-    protected void notifyOfConnectionChange(NetworkInfo info) {
+    public void connectionChanged(NetworkInfo info) {
         if( info.isConnected()) {
             handleConnected();
         } else {
@@ -283,7 +290,10 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
     };
 
     private void listen() {
-        new ReadAsyncTask(activity, currentInfo).execute();
+        if( readTask == null || readTask.isCancelled()) {
+            readTask = new ReadAsyncTask(context, this, currentInfo);
+            readTask.execute();
+        }
     }
 
     private void showRxTx(boolean show) {
@@ -326,99 +336,5 @@ public class MainActivity extends Activity implements WifiP2pManager.PeerListLis
     @Override
     public void onClick(View v) {
         new SendAsyncTask(activity, currentInfo, device).execute(txText.getText().toString());
-    }
-
-    public static class SendAsyncTask extends AsyncTask<String, Void, Boolean> {
-
-        MainActivity activity;
-        int port;
-        String host;
-
-        public SendAsyncTask(MainActivity activity, WifiP2pInfo info, WifiP2pDevice device) {
-            this.activity = activity;
-            this.port = info.isGroupOwner ? MainActivity.OWNER_SEND_PORT : MainActivity.OTHER_SEND_PORT;
-            host = info.isGroupOwner ? device.deviceAddress : info.groupOwnerAddress.getHostAddress();
-            Log.d(TAG, "send: port " + port);
-            Toast.makeText(activity, "send port " + port, Toast.LENGTH_SHORT).show();
-        }
-
-        @Override
-        protected void onPostExecute(Boolean result) {
-            Toast.makeText(activity, "send " + (Boolean.TRUE.equals(result) ? "success" : "failed"), Toast.LENGTH_SHORT).show();
-        }
-
-        @Override
-        protected Boolean doInBackground(String... params) {
-            Socket socket = new Socket();
-
-            try {
-                Log.d(MainActivity.TAG, "Opening send socket - ");
-                socket.bind(null);
-                socket.connect((new InetSocketAddress(host, port)), SOCKET_TIMEOUT);
-
-                Log.d(MainActivity.TAG, "send socket - " + socket.isConnected());
-                OutputStream stream = socket.getOutputStream();
-                final PrintStream printStream = new PrintStream(stream);
-                if( params != null) {
-                    for( String param : params) {
-                        printStream.print(param);
-                    }
-                }
-                printStream.close();
-                Log.d(MainActivity.TAG, "send: Data written");
-                return true;
-            } catch (IOException e) {
-                Log.e(MainActivity.TAG, e.getMessage());
-                return false;
-            } finally {
-                if (socket.isConnected()) {
-                    try {
-                        socket.close();
-                    } catch (IOException e) {
-                        // Give up
-                        e.printStackTrace();
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * A simple server socket that accepts connection and writes some data on the stream.
-     */
-    public static class ReadAsyncTask extends AsyncTask<Void, Void, String> {
-
-        MainActivity activity;
-        int port;
-
-        public ReadAsyncTask(MainActivity activity, WifiP2pInfo info) {
-            this.activity = activity;
-            this.port = info.isGroupOwner ? MainActivity.OTHER_SEND_PORT : MainActivity.OWNER_SEND_PORT;
-            Log.d(TAG, "read: port " + port);
-            Toast.makeText(activity, "read port " + port, Toast.LENGTH_SHORT).show();
-        }
-
-        @Override
-        protected String doInBackground(Void... messages) {
-            String received = null;
-            try {
-                ServerSocket serverSocket = new ServerSocket(port);
-                Log.d(TAG, "read: Socket opened");
-                Socket client = serverSocket.accept();
-                Log.d(TAG, "read: connection done");
-
-                BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
-                received = reader.readLine();
-                serverSocket.close();
-            } catch (IOException e) {
-                Log.e(TAG, e.getMessage());
-            }
-            return received;
-        }
-
-        @Override
-        protected void onPostExecute(String result) {
-            activity.receivedMessage(result);
-        }
     }
 }
